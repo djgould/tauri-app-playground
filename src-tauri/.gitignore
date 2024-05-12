@@ -8,3 +8,5 @@
 
 /src/models/*
 !download-ggml-model.sh
+
+output.wav

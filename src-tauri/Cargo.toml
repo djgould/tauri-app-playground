@@ -17,6 +17,9 @@ tokio = { version = "1", features = ["full"] }
 serde_json = "1"
 whisper-rs = { git = "https://github.com/tazz4843/whisper-rs", branch = "master" }
 hound = "3.5.1"
+cpal = "0.15.3"
+anyhow = "1.0.83"
+rubato = "0.15.0"
 
 [features]
 # This feature is used for production builds or when a dev server is not specified, DO NOT REMOVE!!
