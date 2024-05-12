@@ -38,7 +38,8 @@ async fn transcribe(path: String) -> Result<String, String> {
         if !audio_path.exists() {
             panic!("audio file doesn't exist");
         }
-        let whisper_path = Path::new("/Users/devingould/tauri-app/src-tauri/src/models/ggml-small.en-tdrz.bin");
+        let whisper_path =
+            Path::new("/Users/devingould/tauri-app/src-tauri/src/models/ggml-small.en-tdrz.bin");
         if !whisper_path.exists() {
             panic!("whisper file doesn't exist");
         }
@@ -58,32 +59,42 @@ async fn transcribe(path: String) -> Result<String, String> {
         let mut params = FullParams::new(SamplingStrategy::default());
         params.set_initial_prompt("experience");
         params.set_progress_callback_safe(|progress| println!("Progress callback: {}%", progress));
+        params.set_tdrz_enable(true);
 
         let st = std::time::Instant::now();
-        state.full(params, &samples)
+        state
+            .full(params, &samples)
             .expect("failed to transcribe audio");
 
         let et = std::time::Instant::now();
 
-        let num_segments = state.full_n_segments()
+        let num_segments = state
+            .full_n_segments()
             .expect("failed to get number of segments");
         let mut full_text = String::new();
         for i in 0..num_segments {
-            let segment = state.full_get_segment_text(i)
+            let segment = state
+                .full_get_segment_text(i)
                 .expect("failed to get segment");
             full_text.push_str(&segment);
             full_text.push(' '); // Add a space between segments
-            let start_timestamp = state.full_get_segment_t0(i)
+            if (state.full_get_segment_speaker_turn_next(i)) {
+                full_text.push('-');
+            }
+            let start_timestamp = state
+                .full_get_segment_t0(i)
                 .expect("failed to get start timestamp");
-            let end_timestamp = state.full_get_segment_t1(i)
+            let end_timestamp = state
+                .full_get_segment_t1(i)
                 .expect("failed to get end timestamp");
             println!("[{} - {}]: {}", start_timestamp, end_timestamp, segment);
         }
         println!("Transcription took {}ms", (et - st).as_millis());
         Ok(full_text)
-    }).await.map_err(|e| e.to_string())?
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
-
 
 fn main() {
     tauri::Builder::default()
