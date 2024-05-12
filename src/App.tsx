@@ -9,9 +9,10 @@ function App() {
 
   async function greet() {
     // Learn more about Tauri commands at https://tauri.app/v1/guides/features/command
-    await invoke("transcribe", { path: "./samples/a13.wav" }).then((value) =>
-      setGreetMsg(value)
-    );
+    const value = (await invoke("transcribe", {
+      path: "./samples/a13.wav",
+    })) as string;
+    setGreetMsg(value);
   }
 
   return (
