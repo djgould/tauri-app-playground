@@ -29,64 +29,61 @@ fn parse_wav_file(path: &Path) -> Vec<i16> {
 
 // Learn more about Tauri commands at https://tauri.app/v1/guides/features/command
 #[tauri::command]
-fn transcribe(path: &str) -> String {
-    println!("Path: {}", path);
-    let audio_path = Path::new("/Users/devingould/tauri-app/src-tauri/src/samples/a13.wav");
-    if !audio_path.exists() {
-        panic!("audio file doesn't exist");
-    }
-    let whisper_path = Path::new("/Users/devingould/tauri-app/src-tauri/src/models/ggml-small.en-tdrz.bin");
-    if !whisper_path.exists() {
-        panic!("whisper file doesn't exist")
-    }
+async fn transcribe(path: String) -> Result<String, String> {
+    tokio::task::spawn_blocking(move || {
+        use std::path::Path;
 
-    let original_samples = parse_wav_file(audio_path);
-    let mut samples = vec![0.0f32; original_samples.len()];
-    whisper_rs::convert_integer_to_float_audio(&original_samples, &mut samples)
-        .expect("failed to convert samples");
+        println!("Path: {}", path);
+        let audio_path = Path::new("/Users/devingould/tauri-app/src-tauri/src/samples/a13.wav");
+        if !audio_path.exists() {
+            panic!("audio file doesn't exist");
+        }
+        let whisper_path = Path::new("/Users/devingould/tauri-app/src-tauri/src/models/ggml-small.en-tdrz.bin");
+        if !whisper_path.exists() {
+            panic!("whisper file doesn't exist");
+        }
 
-    let ctx = WhisperContext::new_with_params(
-        &whisper_path.to_string_lossy(),
-        WhisperContextParameters::default(),
-    )
-    .expect("failed to open model");
-    let mut state = ctx.create_state().expect("failed to create key");
-    let mut params = FullParams::new(SamplingStrategy::default());
-    params.set_initial_prompt("experience");
-    params.set_progress_callback_safe(|progress| println!("Progress callback: {}%", progress));
+        // Assuming parse_wav_file and other functions are correctly defined elsewhere
+        let original_samples = parse_wav_file(audio_path);
+        let mut samples = vec![0.0f32; original_samples.len()];
+        whisper_rs::convert_integer_to_float_audio(&original_samples, &mut samples)
+            .expect("failed to convert samples");
 
-    let st = std::time::Instant::now();
-    state
-        .full(params, &samples)
-        .expect("failed to convert samples");
-    let et = std::time::Instant::now();
+        let ctx = WhisperContext::new_with_params(
+            &whisper_path.to_string_lossy(),
+            WhisperContextParameters::default(),
+        )
+        .expect("failed to open model");
+        let mut state = ctx.create_state().expect("failed to create state");
+        let mut params = FullParams::new(SamplingStrategy::default());
+        params.set_initial_prompt("experience");
+        params.set_progress_callback_safe(|progress| println!("Progress callback: {}%", progress));
 
-    let num_segments = state
-        .full_n_segments()
-        .expect("failed to get number of segments");
-    let mut full_text = String::new();
-    for i in 0..num_segments {
-        let segment = state
-            .full_get_segment_text(i)
-            .expect("failed to get segment");
-        full_text.push_str(&segment);
-        let start_timestamp = state
-            .full_get_segment_t0(i)
-            .expect("failed to get start timestamp");
-        let end_timestamp = state
-            .full_get_segment_t1(i)
-            .expect("failed to get end timestamp");
-        println!("[{} - {}]: {}", start_timestamp, end_timestamp, segment);
-    }
-    println!("took {}ms", (et - st).as_millis());
-    full_text
+        let st = std::time::Instant::now();
+        state.full(params, &samples)
+            .expect("failed to transcribe audio");
+
+        let et = std::time::Instant::now();
+
+        let num_segments = state.full_n_segments()
+            .expect("failed to get number of segments");
+        let mut full_text = String::new();
+        for i in 0..num_segments {
+            let segment = state.full_get_segment_text(i)
+                .expect("failed to get segment");
+            full_text.push_str(&segment);
+            full_text.push(' '); // Add a space between segments
+            let start_timestamp = state.full_get_segment_t0(i)
+                .expect("failed to get start timestamp");
+            let end_timestamp = state.full_get_segment_t1(i)
+                .expect("failed to get end timestamp");
+            println!("[{} - {}]: {}", start_timestamp, end_timestamp, segment);
+        }
+        println!("Transcription took {}ms", (et - st).as_millis());
+        Ok(full_text)
+    }).await.map_err(|e| e.to_string())?
 }
 
-// Learn more about Tauri commands at https://tauri.app/v1/guides/features/command
-#[tauri::command]
-fn greet(name: &str) -> String {
-    format!("Hello, {}! You've been greeted from Rust!", name)
-}
 
 fn main() {
     tauri::Builder::default()
