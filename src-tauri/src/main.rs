@@ -4,12 +4,17 @@
 use anyhow::anyhow;
 use anyhow::Result;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::Stream;
 use hound::{SampleFormat, WavReader, WavSpec, WavWriter};
 use rubato::{
     Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction,
 };
-use serde::de;
 use serde::Serialize;
+use std::fs::File;
+use std::io::BufWriter;
+use std::ops::Deref;
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::thread;
 use std::{
     path::Path,
     sync::{Arc, Mutex},
@@ -59,51 +64,70 @@ fn parse_and_resample_wav_file(path: &Path, target_sample_rate: f64) -> Vec<i16>
         .collect();
 
     // Set up resampler if the sample rates are different
-    if (original_sample_rate - target_sample_rate).abs() > f64::EPSILON {
-        let params = SincInterpolationParameters {
-            sinc_len: 256,
-            f_cutoff: 0.90,
-            interpolation: rubato::SincInterpolationType::Cubic,
-            oversampling_factor: 256,
-            window: rubato::WindowFunction::BlackmanHarris2,
-        };
-        let mut resampler = SincFixedIn::<f32>::new(
-            target_sample_rate / original_sample_rate,
-            2.0,
-            params,
-            samples.len(),
-            1, // Channels
-        )
-        .unwrap();
-
-        // Convert i16 to f32 samples
-        let f32_samples: Vec<f32> = samples
-            .iter()
-            .map(|&s| s as f32 / i16::MAX as f32)
-            .collect();
-
-        let waves_in = &[f32_samples];
-        // Resample
-        let resampled_samples = resampler.process(waves_in, None).unwrap();
-
-        // Convert back to i16
-        resampled_samples[0]
-            .iter()
-            .map(|&s| (s * i16::MAX as f32) as i16)
-            .collect()
+    let resampled_samples = if (spec.sample_rate as f64 - target_sample_rate).abs() > f64::EPSILON {
+        resample_audio(samples, spec.sample_rate, target_sample_rate, spec.channels)
     } else {
         samples
-    }
+    };
+
+    // Save the resampled audio to a new file
+    // save_to_wav(
+    //     &resampled_samples,
+    //     spec.channels,
+    //     target_sample_rate as u32,
+    //     "output_resampled.wav",
+    // );
+
+    resampled_samples
+}
+
+fn resample_audio(
+    samples: Vec<i16>,
+    original_rate: u32,
+    target_rate: f64,
+    channels: u16,
+) -> Vec<i16> {
+    let params = SincInterpolationParameters {
+        sinc_len: 256,
+        f_cutoff: 0.90,
+        interpolation: rubato::SincInterpolationType::Cubic,
+        oversampling_factor: 256,
+        window: rubato::WindowFunction::BlackmanHarris2,
+    };
+    let mut resampler = SincFixedIn::<f32>::new(
+        target_rate / original_rate as f64,
+        2.0,
+        params,
+        samples.len(),
+        1, // Channels
+    )
+    .unwrap();
+
+    // Convert i16 to f32 samples
+    let f32_samples: Vec<f32> = samples
+        .iter()
+        .map(|&s| s as f32 / i16::MAX as f32)
+        .collect();
+
+    let waves_in = &[f32_samples];
+    // Resample
+    let resampled_samples = resampler.process(waves_in, None).unwrap();
+
+    // Convert back to i16
+    return resampled_samples[0]
+        .iter()
+        .map(|&s| (s * i16::MAX as f32) as i16)
+        .collect();
 }
 
 // Learn more about Tauri commands at https://tauri.app/v1/guides/features/command
 #[tauri::command]
-async fn transcribe(path: String) -> Result<String, String> {
+async fn transcribe(path: String) -> Result<Vec<String>, String> {
     tokio::task::spawn_blocking(move || {
         use std::path::Path;
 
         println!("Path: {}", path);
-        let audio_path = Path::new("/Users/devingould/tauri-app/src-tauri/output.wav");
+        let audio_path = Path::new("/Users/devingould/tauri-app/src-tauri/src/samples/a13.wav");
         if !audio_path.exists() {
             panic!("audio file doesn't exist");
         }
@@ -140,15 +164,16 @@ async fn transcribe(path: String) -> Result<String, String> {
         let num_segments = state
             .full_n_segments()
             .expect("failed to get number of segments");
-        let mut full_text = String::new();
+        let mut full_text: Vec<String> = vec![String::new()];
+        let mut full_text_index = 0;
         for i in 0..num_segments {
             let segment = state
                 .full_get_segment_text(i)
                 .expect("failed to get segment");
-            full_text.push_str(&segment);
-            full_text.push(' '); // Add a space between segments
+            full_text[full_text_index].push_str(&segment);
             if (state.full_get_segment_speaker_turn_next(i)) {
-                full_text.push('-');
+                full_text.push(String::new());
+                full_text_index += 1
             }
             let start_timestamp = state
                 .full_get_segment_t0(i)
@@ -170,12 +195,151 @@ struct Error {
     message: String,
 }
 
+struct Recorder {
+    writer: Arc<Mutex<Option<WavWriter<BufWriter<File>>>>>,
+    stream: Option<Stream>,
+}
+
+impl Recorder {
+    fn new() -> Result<Self> {
+        let host = cpal::default_host();
+        let device = host
+            .default_input_device()
+            .expect("No input device available");
+        let config = device.default_input_config()?;
+
+        let spec = WavSpec {
+            channels: config.channels(),
+            sample_rate: config.sample_rate().0,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+
+        let writer = Arc::new(Mutex::new(None));
+
+        Ok(Self {
+            writer: writer,
+            stream: None,
+        })
+    }
+
+    fn start(&mut self) -> Result<()> {
+        let device = cpal::default_host()
+            .default_input_device()
+            .expect("No input device available");
+        let config = device.default_input_config()?;
+
+        let spec = WavSpec {
+            channels: config.channels(),
+            sample_rate: config.sample_rate().0,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        self.writer = Arc::new(Mutex::new(Some(WavWriter::create("output.wav", spec)?)));
+
+        let writer_clone = self.writer.clone();
+        let stream = device.build_input_stream(
+            &config.into(),
+            move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                if let Ok(mut writer_lock) = writer_clone.lock() {
+                    if let Some(ref mut writer) = *writer_lock {
+                        for &sample in data {
+                            let amplitude = (sample * i16::MAX as f32) as i16;
+                            writer
+                                .write_sample(amplitude)
+                                .expect("Failed to write sample");
+                        }
+                    }
+                }
+            },
+            |err| eprintln!("Error: {:?}", err),
+            Some(std::time::Duration::from_secs(30)),
+        )?;
+
+        stream.play()?;
+        self.stream = Some(stream);
+        Ok(())
+    }
+
+    fn stop(&mut self) -> Result<()> {
+        if let Some(stream) = self.stream.take() {
+            stream.pause()?;
+            drop(stream);
+        }
+
+        // Take out the WavWriter, finalize it, and replace with None
+        let maybe_writer = {
+            let mut writer_lock = self.writer.lock().unwrap();
+            writer_lock.take() // This takes the WavWriter out and leaves None in its place
+        };
+
+        if let Some(mut writer) = maybe_writer {
+            writer.finalize()?; // Now you can finalize without moving out of the MutexGuard
+        }
+
+        Ok(())
+    }
+}
+
+pub struct RecorderState(Mutex<Recorder>);
+
 impl From<anyhow::Error> for Error {
     fn from(err: anyhow::Error) -> Self {
         Error {
             message: err.to_string(),
         }
     }
+}
+
+enum AudioCommand {
+    Start,
+    Stop,
+}
+
+struct AudioController {
+    sender: Sender<AudioCommand>,
+}
+
+impl AudioController {
+    fn new() -> Self {
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let mut recorder = Recorder::new().expect("Failed to initialize the recorder");
+            for command in receiver {
+                match command {
+                    AudioCommand::Start => {
+                        recorder.start().expect("Failed to start recording");
+                    }
+                    AudioCommand::Stop => {
+                        recorder.stop().expect("Failed to stop recording");
+                    }
+                }
+            }
+        });
+        AudioController { sender }
+    }
+
+    fn start(&self) {
+        self.sender
+            .send(AudioCommand::Start)
+            .expect("Failed to send start command");
+    }
+
+    fn stop(&self) {
+        self.sender
+            .send(AudioCommand::Stop)
+            .expect("Failed to send stop command");
+    }
+}
+
+#[tauri::command]
+fn start_recording(audio_controller: tauri::State<'_, Arc<AudioController>>) {
+    audio_controller.start();
+}
+
+#[tauri::command]
+fn stop_recording(audio_controller: tauri::State<'_, Arc<AudioController>>) {
+    audio_controller.stop();
 }
 
 #[tauri::command]
@@ -201,7 +365,7 @@ fn record() -> Result<(), Error> {
         sample_format: hound::SampleFormat::Int,
     };
 
-    let writer = Arc::new(Mutex::new(
+    let writer: Arc<Mutex<WavWriter<std::io::BufWriter<std::fs::File>>>> = Arc::new(Mutex::new(
         WavWriter::create("output.wav", spec).map_err(|e| anyhow!(e))?,
     ));
 
@@ -238,8 +402,16 @@ fn record() -> Result<(), Error> {
 }
 
 fn main() {
+    let audio_controller = Arc::new(AudioController::new());
+
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![transcribe, record])
+        .manage(audio_controller)
+        .invoke_handler(tauri::generate_handler![
+            transcribe,
+            start_recording,
+            stop_recording,
+            record
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

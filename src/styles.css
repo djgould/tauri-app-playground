@@ -53,7 +53,7 @@ h1 {
   text-align: center;
 }
 
-input,
+/* input,
 button {
   border-radius: 8px;
   border: 1px solid transparent;
@@ -77,7 +77,7 @@ button:hover {
 button:active {
   border-color: #396cd8;
   background-color: #e8e8e8;
-}
+} */
 
 input,
 button {
